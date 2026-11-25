@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import tempfile
@@ -53,9 +54,17 @@ def get_tracks(page):
     }))""")
 
 
-def collect_tracks(page, expected, cancel, log):
+def validate_scan_timing(scroll_wait, loading_wait):
+    if not math.isfinite(scroll_wait) or scroll_wait <= 0:
+        raise DownloadError("Scroll wait must be a positive number of seconds.")
+    if not math.isfinite(loading_wait) or loading_wait < scroll_wait:
+        raise DownloadError("No-progress wait must be at least as long as the scroll wait.")
+
+
+def collect_tracks(page, expected, cancel, log, *, scroll_wait=1, loading_wait=30):
     """Scan until loading settles, or require an explicit full-library count."""
-    deadline = time.monotonic() + 30
+    validate_scan_timing(scroll_wait, loading_wait)
+    deadline = time.monotonic() + loading_wait
     largest = 0
     while True:
         check_cancelled(cancel)
@@ -71,16 +80,19 @@ def collect_tracks(page, expected, cancel, log):
             return tracks
         if len(tracks) > largest:
             largest = len(tracks)
-            deadline = time.monotonic() + (5 if expected is None else 30)
+            deadline = time.monotonic() + loading_wait
             log(f"Loaded {largest} tracks." if expected is None else f"Loaded {largest} of {expected} expected tracks.")
         if time.monotonic() >= deadline:
             if expected is None:
                 if tracks:
+                    log(f"No new tracks for {loading_wait:g} seconds. "
+                        "The scan may be incomplete; confirm the full-library count before downloading.")
                     return tracks
                 raise DownloadError("No purchased tracks were found. Check sign-in and the Purchased page, then scan again.")
             raise DownloadError(
                 f"Only {len(tracks)} of {expected} expected tracks loaded. "
-                "Check the count, your connection, and Amazon's Purchased page, then try again."
+                f"No new tracks appeared for {loading_wait:g} seconds. "
+                "Check the count, increase the loading waits, or check Amazon's Purchased page, then try again."
             )
         if tracks:
             page.locator(TRACKS).last.scroll_into_view_if_needed(timeout=10000)
@@ -92,7 +104,12 @@ def collect_tracks(page, expected, cancel, log):
                 }
                 if (element) element.scrollTop = element.scrollHeight;
             }""", TRACKS)
-        page.wait_for_timeout(1000)
+        remaining = scroll_wait * 1000
+        while remaining > 0:
+            check_cancelled(cancel)
+            interval = min(remaining, 250)
+            page.wait_for_timeout(interval)
+            remaining -= interval
 
 
 def read_manifest(directory):

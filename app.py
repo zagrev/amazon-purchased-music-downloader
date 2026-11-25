@@ -9,7 +9,10 @@ from tkinter import font
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
-from downloader import Cancelled, DownloadError, PURCHASES_URL, collect_tracks, download_tracks, open_purchased_page
+from downloader import (
+    Cancelled, DownloadError, PURCHASES_URL, collect_tracks, download_tracks,
+    open_purchased_page, validate_scan_timing,
+)
 
 
 BROWSERS = {
@@ -68,6 +71,15 @@ class App(tk.Tk):
         ttk.Entry(count_row, textvariable=self.expected, width=8).pack(side="left", padx=8)
         ttk.Label(count_row, text="Scan first, then check or correct the full-library count.").pack(side="left")
 
+        timing_row = ttk.Frame(frame)
+        timing_row.pack(fill="x", pady=(0, 12))
+        ttk.Label(timing_row, text="Scroll wait (seconds):").pack(side="left")
+        self.scroll_wait = tk.StringVar(value="1")
+        ttk.Entry(timing_row, textvariable=self.scroll_wait, width=6).pack(side="left", padx=8)
+        ttk.Label(timing_row, text="No-progress wait (seconds):").pack(side="left")
+        self.loading_wait = tk.StringVar(value="30")
+        ttk.Entry(timing_row, textvariable=self.loading_wait, width=6).pack(side="left", padx=8)
+
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x")
         self.start_button = ttk.Button(buttons, text="Open Amazon Music", command=self.start)
@@ -100,7 +112,18 @@ class App(tk.Tk):
         self.submit("open")
 
     def scan(self):
-        self.submit("scan")
+        timing = self.read_scan_timing()
+        if timing is not None:
+            self.submit("scan", timing)
+
+    def read_scan_timing(self):
+        try:
+            timing = (float(self.scroll_wait.get()), float(self.loading_wait.get()))
+            validate_scan_timing(*timing)
+            return timing
+        except (ValueError, DownloadError) as exc:
+            messagebox.showerror("Loading waits", f"Invalid loading waits: {exc}")
+            return None
 
     def download(self):
         try:
@@ -109,6 +132,9 @@ class App(tk.Tk):
                 raise ValueError
         except ValueError:
             messagebox.showerror("Track count", "Enter the full number of purchased tracks (at least 1).")
+            return
+        timing = self.read_scan_timing()
+        if timing is None:
             return
         if not self.folder.get().strip():
             messagebox.showerror("Save folder", "Choose a save folder.")
@@ -119,7 +145,7 @@ class App(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Save folder", str(exc))
             return
-        self.submit("download", (directory, count))
+        self.submit("download", (directory, count, *timing))
 
     def update_buttons(self):
         idle = not self.running and not self.closing
@@ -173,14 +199,22 @@ class App(tk.Tk):
                             else:
                                 open_purchased_page(page)
                                 if action == "scan":
-                                    log("Scanning Purchased. Waiting for the list to stop growing...")
-                                    tracks = collect_tracks(page, None, self.cancel, log)
+                                    scroll_wait, loading_wait = payload
+                                    log(f"Scanning Purchased: {scroll_wait:g}s between scrolls, "
+                                        f"{loading_wait:g}s without new tracks before stopping.")
+                                    tracks = collect_tracks(
+                                        page, None, self.cancel, log,
+                                        scroll_wait=scroll_wait, loading_wait=loading_wait,
+                                    )
                                     self.messages.put(("scanned", len(tracks)))
                                     log(f"Scan found {len(tracks)} tracks. Check or adjust the count, then click Download. "
                                         "A paused or partial list may undercount your purchases.")
                                 elif action == "download":
-                                    directory, count = payload
-                                    tracks = collect_tracks(page, count, self.cancel, log)
+                                    directory, count, scroll_wait, loading_wait = payload
+                                    tracks = collect_tracks(
+                                        page, count, self.cancel, log,
+                                        scroll_wait=scroll_wait, loading_wait=loading_wait,
+                                    )
                                     completed = download_tracks(page, directory, tracks, self.cancel, log)
                                     log(f"Finished: {completed} tracks downloaded or previously recorded.")
                         except (DownloadError, Cancelled, PlaywrightError, OSError) as exc:

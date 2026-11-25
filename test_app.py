@@ -51,18 +51,20 @@ class SessionTests(unittest.TestCase):
             try:
                 app.commands.put(("open", None))
                 finish_command()
-                app.commands.put(("scan", None))
+                app.commands.put(("scan", (3, 60)))
                 self.assertIn("Stopped: Wrong count", finish_command())
-                app.commands.put(("download", ("destination", 1)))
+                app.commands.put(("download", ("destination", 1, 3, 60)))
                 self.assertIn("Finished: 1 tracks downloaded or previously recorded.", finish_command())
                 self.assertEqual(collect.call_count, 2)
+                for call in collect.call_args_list:
+                    self.assertEqual(call.kwargs, {"scroll_wait": 3, "loading_wait": 60})
                 download.assert_called_once()
                 playwright.chromium.launch.assert_called_once()
                 browser.new_context.assert_called_once_with(accept_downloads=True)
                 app.cancel.set()
                 # Exercise the real cancellation check without touching Amazon.
                 collect.side_effect = collect_tracks
-                app.commands.put(("scan", None))
+                app.commands.put(("scan", (3, 60)))
                 self.assertIn("Stopped: Stopped by user.", finish_command())
                 playwright.chromium.launch.assert_called_once()
             finally:

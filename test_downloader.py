@@ -2,7 +2,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from playwright.sync_api import sync_playwright
 
@@ -15,6 +15,7 @@ from downloader import (
     download_tracks,
     open_purchased_page,
     read_manifest,
+    validate_scan_timing,
 )
 
 
@@ -109,7 +110,7 @@ class DownloadTests(unittest.TestCase):
         self.context.add_cookies([{
             "name": "test-session", "value": "signed-in", "url": PURCHASES_URL,
         }])
-        tracks = collect_tracks(self.page, None, self.cancel, lambda _: None)
+        tracks = collect_tracks(self.page, None, self.cancel, lambda _: None, scroll_wait=0.1, loading_wait=0.5)
         self.assertEqual(len(tracks), 3)
         with self.assertRaisesRegex(DownloadError, "more than the expected"):
             collect_tracks(self.page, 2, self.cancel, lambda _: None)
@@ -117,6 +118,47 @@ class DownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             self.assertEqual(download_tracks(self.page, temp, tracks, self.cancel, lambda _: None), 3)
         self.assertEqual(self.context.cookies()[0]["value"], "signed-in")
+
+    def test_scan_waits_for_batch_delayed_beyond_old_five_second_cutoff(self):
+        delayed_page = PAGE.replace(
+            "list.addEventListener('scroll', () => { if (list.scrollTop + list.clientHeight >= list.scrollHeight - 1) add(); });",
+            """let pending = false;
+list.addEventListener('scroll', () => {
+  if (!pending && count < 3 && list.scrollTop + list.clientHeight >= list.scrollHeight - 1) {
+    pending = true;
+    setTimeout(() => { add(); pending = false; }, 5500);
+  }
+});""",
+        )
+        self.page.route(
+            PURCHASES_URL,
+            lambda route: route.fulfill(status=200, content_type="text/html", body=delayed_page),
+        )
+        self.page.reload()
+        tracks = collect_tracks(
+            self.page, None, self.cancel, lambda _: None, scroll_wait=0.25, loading_wait=7,
+        )
+        self.assertEqual([track["id"] for track in tracks], ["TRACK1", "TRACK2", "TRACK3"])
+
+    def test_explicit_count_still_rejects_stalled_partial_list(self):
+        self.page.evaluate("count = 3")
+        with self.assertRaisesRegex(DownloadError, "Only 2 of 3"):
+            collect_tracks(self.page, 3, self.cancel, lambda _: None, scroll_wait=0.1, loading_wait=0.5)
+
+    def test_long_scroll_wait_remains_cancellable(self):
+        page = Mock()
+        page.url = PURCHASES_URL
+        page.get_by_role.return_value.count.return_value = 1
+        page.locator.return_value.evaluate_all.return_value = [{"id": "TRACK1", "label": "Song"}]
+        page.wait_for_timeout.side_effect = lambda _: self.cancel.set()
+        with self.assertRaises(Cancelled):
+            collect_tracks(page, None, self.cancel, lambda _: None, scroll_wait=60, loading_wait=120)
+        page.wait_for_timeout.assert_called_once_with(250)
+
+    def test_invalid_loading_waits_are_rejected(self):
+        for scroll, loading in [(0, 30), (-1, 30), (float("nan"), 30), (1, float("inf")), (5, 1)]:
+            with self.subTest(scroll=scroll, loading=loading), self.assertRaises(DownloadError):
+                validate_scan_timing(scroll, loading)
 
     def test_empty_scan_reports_error(self):
         self.page.locator("#items").evaluate("(e) => e.innerHTML = ''")
