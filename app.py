@@ -1,8 +1,10 @@
+import argparse
 import queue
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
@@ -10,9 +12,21 @@ from playwright.sync_api import sync_playwright
 from downloader import Cancelled, DownloadError, PURCHASES_URL, collect_tracks, download_tracks, open_purchased_page
 
 
+BROWSERS = {
+    "edge": ("chromium", "msedge"),
+    "chrome": ("chromium", "chrome"),
+    "chromium": ("chromium", None),
+    "firefox": ("firefox", None),
+    "webkit": ("webkit", None),
+}
+
+
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, browser="edge"):
+        if browser not in BROWSERS:
+            raise ValueError(f"Unsupported browser: {browser}")
         super().__init__()
+        self.browser_choice = browser
         self.title("Purchased Music Downloader")
         self.geometry("800x560")
         self.minsize(740, 450)
@@ -25,12 +39,18 @@ class App(tk.Tk):
         self.browser_open = False
         self.scanned = False
 
+        default_font = font.nametofont("TkDefaultFont")
+        default_font.configure(family="Segoe UI", size=12)
+
+        font.nametofont("TkTextFont").configure(family="Segoe UI", size=12)
+        font.nametofont("TkFixedFont").configure(family="Consolas", size=12)
+
         frame = ttk.Frame(self, padding=16)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="Amazon Purchased Music", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(
             frame,
-            text="Sign in in Edge. Your sign-in is kept only until this app closes.",
+            text=f"Selected browser: {browser}. Your sign-in is kept only until this app closes.",
             wraplength=720,
         ).pack(anchor="w", pady=(6, 12))
 
@@ -76,7 +96,7 @@ class App(tk.Tk):
         self.commands.put((action, payload))
 
     def start(self):
-        self.log("Opening Edge. Sign in, then click 'Signed in: scan / rescan'.")
+        self.log(f"Opening {self.browser_choice}. Sign in, then click 'Signed in: scan / rescan'.")
         self.submit("open")
 
     def scan(self):
@@ -111,7 +131,7 @@ class App(tk.Tk):
     def stop(self):
         self.cancel.set()
         self.stop_button.config(state="disabled")
-        self.log("Stopping after the current browser operation; Edge will stay open.")
+        self.log("Stopping after the current browser operation; the browser will stay open.")
 
     def close(self):
         if self.closing:
@@ -139,7 +159,8 @@ class App(tk.Tk):
                             break
                         try:
                             if browser is None or not browser.is_connected():
-                                browser = playwright.chromium.launch(channel="msedge", headless=False)
+                                engine, channel = BROWSERS[self.browser_choice]
+                                browser = getattr(playwright, engine).launch(channel=channel, headless=False)
                                 context = page = None
                             if context is None:
                                 context = browser.new_context(accept_downloads=True)
@@ -212,5 +233,15 @@ class App(tk.Tk):
         self.after(100, self.poll)
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Download purchased MP3s from Amazon Music.")
+    parser.add_argument(
+        "--browser", choices=BROWSERS, default="edge",
+        help="Browser to use (default: edge). Chrome and Edge must be installed; other choices need Playwright browser binaries.",
+    )
+    args = parser.parse_args(argv)
+    App(browser=args.browser).mainloop()
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    main()

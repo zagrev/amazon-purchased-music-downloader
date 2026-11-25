@@ -1,16 +1,19 @@
+import io
 import queue
 import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from app import App
+from app import App, main
 from downloader import DownloadError, collect_tracks
 
 
 class SessionTests(unittest.TestCase):
     def test_worker_reuses_browser_after_error_completion_and_stop_until_app_closes(self):
-        app = SimpleNamespace(commands=queue.Queue(), messages=queue.Queue(), cancel=threading.Event())
+        app = SimpleNamespace(
+            commands=queue.Queue(), messages=queue.Queue(), cancel=threading.Event(), browser_choice="edge",
+        )
         browser = Mock()
         browser.is_connected.return_value = True
         page = browser.new_context.return_value.new_page.return_value
@@ -67,6 +70,58 @@ class SessionTests(unittest.TestCase):
                 worker.join(timeout=5)
             self.assertFalse(worker.is_alive())
             browser.close.assert_called_once()
+
+
+class BrowserSelectionTests(unittest.TestCase):
+    def test_command_line_default_and_selections(self):
+        for args, expected in [
+            ([], "edge"),
+            (["--browser", "edge"], "edge"),
+            (["--browser", "chrome"], "chrome"),
+            (["--browser", "chromium"], "chromium"),
+            (["--browser", "firefox"], "firefox"),
+            (["--browser", "webkit"], "webkit"),
+        ]:
+            with self.subTest(args=args), patch("app.App") as app:
+                main(args)
+                app.assert_called_once_with(browser=expected)
+                app.return_value.mainloop.assert_called_once()
+
+    def test_invalid_browser_exits_before_creating_window(self):
+        with patch("app.App") as app, patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(SystemExit) as result:
+                main(["--browser", "unsupported"])
+            self.assertEqual(result.exception.code, 2)
+            self.assertIn("invalid choice", stderr.getvalue())
+            app.assert_not_called()
+
+    def test_worker_launches_selected_engine_and_channel(self):
+        for choice, engine, channel in [
+            ("edge", "chromium", "msedge"),
+            ("chrome", "chromium", "chrome"),
+            ("chromium", "chromium", None),
+            ("firefox", "firefox", None),
+            ("webkit", "webkit", None),
+        ]:
+            with self.subTest(browser=choice), patch("app.sync_playwright") as start:
+                app = SimpleNamespace(
+                    commands=queue.Queue(), messages=queue.Queue(),
+                    cancel=threading.Event(), browser_choice=choice,
+                )
+                app.commands.put(("open", None))
+                app.commands.put(("close", None))
+                playwright = start.return_value.__enter__.return_value
+                browser = getattr(playwright, engine).launch.return_value
+                App.worker(app)
+                getattr(playwright, engine).launch.assert_called_once_with(channel=channel, headless=False)
+                browser.new_context.assert_called_once_with(accept_downloads=True)
+                browser.close.assert_called_once()
+                logs = []
+                while not app.messages.empty():
+                    kind, value = app.messages.get_nowait()
+                    if kind == "log":
+                        logs.append(value)
+                self.assertEqual(logs, [])
 
 
 if __name__ == "__main__":
