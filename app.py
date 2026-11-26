@@ -40,7 +40,7 @@ class App(tk.Tk):
         self.closing = False
         self.session_closed = False
         self.browser_open = False
-        self.scanned = False
+        self.scanned_count = None
 
         default_font = font.nametofont("TkDefaultFont")
         default_font.configure(family="Segoe UI", size=12)
@@ -133,6 +133,16 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror("Track count", "Enter the full number of purchased tracks (at least 1).")
             return
+        if self.scanned_count is None:
+            messagebox.showerror("Scan required", "Scan Purchased in the current browser session before downloading.")
+            return
+        if count != self.scanned_count:
+            messagebox.showerror(
+                "Track count",
+                f"The cached scan contains {self.scanned_count} tracks, but you entered {count}. "
+                "Check the full-library count and rescan if tracks are missing.",
+            )
+            return
         timing = self.read_scan_timing()
         if timing is None:
             return
@@ -151,7 +161,9 @@ class App(tk.Tk):
         idle = not self.running and not self.closing
         self.start_button.config(state="normal" if idle else "disabled")
         self.scan_button.config(state="normal" if idle and self.browser_open else "disabled")
-        self.download_button.config(state="normal" if idle and self.browser_open and self.scanned else "disabled")
+        self.download_button.config(
+            state="normal" if idle and self.browser_open and self.scanned_count is not None else "disabled",
+        )
         self.stop_button.config(state="normal" if self.running and not self.closing else "disabled")
 
     def stop(self):
@@ -175,7 +187,13 @@ class App(tk.Tk):
         def log(message):
             self.messages.put(("log", message))
 
+        def invalidate_scan():
+            nonlocal cached_tracks
+            cached_tracks = None
+            self.messages.put(("scan-invalidated", None))
+
         browser = context = page = None
+        cached_tracks = None
         try:
             with sync_playwright() as playwright:
                 try:
@@ -185,44 +203,61 @@ class App(tk.Tk):
                             break
                         try:
                             if browser is None or not browser.is_connected():
+                                invalidate_scan()
                                 engine, channel = BROWSERS[self.browser_choice]
                                 browser = getattr(playwright, engine).launch(channel=channel, headless=False)
                                 context = page = None
                             if context is None:
+                                invalidate_scan()
                                 context = browser.new_context(accept_downloads=True)
                             if page is None or page.is_closed():
+                                invalidate_scan()
                                 page = context.new_page()
                                 page.goto(PURCHASES_URL, wait_until="domcontentloaded", timeout=60000)
                             self.messages.put(("browser", True))
                             if action == "open":
                                 page.bring_to_front()
                             else:
+                                if action == "scan":
+                                    invalidate_scan()
                                 open_purchased_page(page)
                                 if action == "scan":
                                     scroll_wait, loading_wait = payload
                                     log(f"Scanning Purchased: {scroll_wait:g}s between scrolls, "
                                         f"{loading_wait:g}s without new tracks before stopping.")
-                                    tracks = collect_tracks(
+                                    cached_tracks = collect_tracks(
                                         page, None, self.cancel, log,
                                         scroll_wait=scroll_wait, loading_wait=loading_wait,
                                     )
-                                    self.messages.put(("scanned", len(tracks)))
-                                    log(f"Scan found {len(tracks)} tracks. Check or adjust the count, then click Download. "
+                                    self.messages.put(("scanned", len(cached_tracks)))
+                                    log(f"Scan found {len(cached_tracks)} tracks. Check or adjust the count, then click Download. "
                                         "A paused or partial list may undercount your purchases.")
                                 elif action == "download":
                                     directory, count, scroll_wait, loading_wait = payload
-                                    tracks = collect_tracks(
-                                        page, count, self.cancel, log,
+                                    if cached_tracks is None:
+                                        raise DownloadError(
+                                            "Scan Purchased in the current browser session before downloading."
+                                        )
+                                    if count != len(cached_tracks):
+                                        raise DownloadError(
+                                            f"The cached scan contains {len(cached_tracks)} tracks, but you entered {count}. "
+                                            "Check the full-library count and rescan if tracks are missing."
+                                        )
+                                    log(f"Using cached scan of {len(cached_tracks)} tracks; no full rescan needed.")
+                                    completed = download_tracks(
+                                        page, directory, cached_tracks, self.cancel, log,
                                         scroll_wait=scroll_wait, loading_wait=loading_wait,
                                     )
-                                    completed = download_tracks(page, directory, tracks, self.cancel, log)
                                     log(f"Finished: {completed} tracks downloaded or previously recorded.")
                         except (DownloadError, Cancelled, PlaywrightError, OSError) as exc:
                             log(f"Stopped: {exc}")
                         except Exception as exc:
                             log(f"Stopped because of an unexpected error ({type(exc).__name__}): {exc}")
                         finally:
-                            self.messages.put(("browser", browser is not None and browser.is_connected()))
+                            connected = browser is not None and browser.is_connected()
+                            if not connected or page is None or page.is_closed():
+                                invalidate_scan()
+                            self.messages.put(("browser", connected))
                             self.messages.put(("done", None))
                 finally:
                     if browser is not None and browser.is_connected():
@@ -247,9 +282,13 @@ class App(tk.Tk):
                     self.log(value)
                 elif kind == "browser":
                     self.browser_open = value
+                    if not value:
+                        self.scanned_count = None
+                elif kind == "scan-invalidated":
+                    self.scanned_count = None
                 elif kind == "scanned":
                     self.expected.set(str(value))
-                    self.scanned = True
+                    self.scanned_count = value
                 elif kind == "done":
                     self.running = False
                     self.update_buttons()

@@ -48,10 +48,22 @@ def open_purchased_page(page):
 
 
 def get_tracks(page):
-    return page.locator(TRACKS).evaluate_all("""buttons => buttons.map(button => ({
-        id: button.id,
-        label: button.getAttribute('aria-label')
-    }))""")
+    tracks = page.locator(TRACKS).evaluate_all("""buttons => buttons.map(button => {
+        const item = button.closest('[data-testid="ListItemStack"]')?.parentElement
+            .querySelector('[data-testid="ListItem,Library_PurchasedSongItem"]');
+        const titles = item?.querySelectorAll('div[dir="auto"][tabindex="-1"][aria-label]');
+        return {
+            id: button.id,
+            label: titles?.length === 1 ? titles[0].getAttribute('aria-label') : null
+        };
+    })""")
+    for track in tracks:
+        if not isinstance(track["label"], str) or not track["label"].strip():
+            raise DownloadError(
+                f"Could not find a unique track title for {track['id']}; "
+                "Amazon's Purchased page structure may have changed. No downloads were started."
+            )
+    return tracks
 
 
 def validate_scan_timing(scroll_wait, loading_wait):
@@ -61,11 +73,45 @@ def validate_scan_timing(scroll_wait, loading_wait):
         raise DownloadError("No-progress wait must be at least as long as the scroll wait.")
 
 
+def wait_for_scroll(page, seconds, cancel):
+    remaining = seconds * 1000
+    while remaining > 0:
+        check_cancelled(cancel)
+        interval = min(remaining, 250)
+        page.wait_for_timeout(interval)
+        remaining -= interval
+
+
+def scroll_library(page, *, to_top=False):
+    state = page.evaluate("""({selector, toTop}) => {
+        let element = document.querySelector(selector);
+        if (!element) return null;
+        while (element && !(element.clientHeight > 200 &&
+               ['auto', 'scroll'].includes(getComputedStyle(element).overflowY))) {
+            element = element.parentElement;
+        }
+        element = element || document.scrollingElement;
+        if (!element) return null;
+        const before = element.scrollTop;
+        const maximum = Math.max(0, element.scrollHeight - element.clientHeight);
+        element.scrollTop = toTop ? 0 : Math.min(maximum, before + element.clientHeight * 0.8);
+        return {
+            moved: Math.abs(element.scrollTop - before) > 1,
+            bottom: element.scrollTop >= maximum - 1
+        };
+    }""", {"selector": TRACKS, "toTop": to_top})
+    if state is None:
+        raise DownloadError("Could not find the Purchased list to scroll. Check the browser page and try again.")
+    return state
+
+
 def collect_tracks(page, expected, cancel, log, *, scroll_wait=1, loading_wait=30):
-    """Scan until loading settles, or require an explicit full-library count."""
+    """Accumulate unique tracks across a virtualized list, starting at the top."""
     validate_scan_timing(scroll_wait, loading_wait)
     deadline = time.monotonic() + loading_wait
-    largest = 0
+    seen = {}
+    started = False
+    at_bottom = False
     while True:
         check_cancelled(cancel)
         validate_purchase_page(page)
@@ -74,42 +120,69 @@ def collect_tracks(page, expected, cancel, log, *, scroll_wait=1, loading_wait=3
             raise DownloadError("Amazon returned a track without a usable ID; no downloads were started.")
         if len({track["id"] for track in tracks}) != len(tracks):
             raise DownloadError("Amazon returned duplicate track IDs; no downloads were started.")
-        if expected is not None and len(tracks) > expected:
-            raise DownloadError(f"Amazon showed {len(tracks)} tracks, more than the expected {expected}. Correct the expected count.")
-        if expected is not None and len(tracks) == expected:
-            return tracks
-        if len(tracks) > largest:
-            largest = len(tracks)
+        if tracks and not started:
+            started = True
+            if scroll_library(page, to_top=True)["moved"]:
+                wait_for_scroll(page, scroll_wait, cancel)
+                deadline = time.monotonic() + loading_wait
+                continue
+        previous_count = len(seen)
+        for track in tracks:
+            seen[track["id"]] = track
+        count = len(seen)
+        if expected is not None and count > expected:
+            raise DownloadError(f"Amazon showed {count} tracks, more than the expected {expected}. Correct the expected count.")
+        if count > previous_count:
             deadline = time.monotonic() + loading_wait
-            log(f"Loaded {largest} tracks." if expected is None else f"Loaded {largest} of {expected} expected tracks.")
+            log(f"Loaded {count} tracks." if expected is None else f"Loaded {count} of {expected} expected tracks.")
+        if expected is not None and count == expected:
+            return list(seen.values())
         if time.monotonic() >= deadline:
             if expected is None:
-                if tracks:
+                if seen and at_bottom:
                     log(f"No new tracks for {loading_wait:g} seconds. "
                         "The scan may be incomplete; confirm the full-library count before downloading.")
-                    return tracks
+                    return list(seen.values())
+                if seen:
+                    raise DownloadError(
+                        f"Found {count} tracks, but scrolling stalled before the end of Purchased. "
+                        "Check the browser page and try again."
+                    )
                 raise DownloadError("No purchased tracks were found. Check sign-in and the Purchased page, then scan again.")
             raise DownloadError(
-                f"Only {len(tracks)} of {expected} expected tracks loaded. "
+                f"Only {count} of {expected} expected tracks loaded. "
                 f"No new tracks appeared for {loading_wait:g} seconds. "
                 "Check the count, increase the loading waits, or check Amazon's Purchased page, then try again."
             )
         if tracks:
-            page.locator(TRACKS).last.scroll_into_view_if_needed(timeout=10000)
-            page.evaluate("""selector => {
-                let element = document.querySelector(selector);
-                while (element && !(element.scrollHeight > element.clientHeight + 10 &&
-                       element.clientHeight > 200 && getComputedStyle(element).overflowY === 'auto')) {
-                    element = element.parentElement;
-                }
-                if (element) element.scrollTop = element.scrollHeight;
-            }""", TRACKS)
-        remaining = scroll_wait * 1000
-        while remaining > 0:
-            check_cancelled(cancel)
-            interval = min(remaining, 250)
-            page.wait_for_timeout(interval)
-            remaining -= interval
+            state = scroll_library(page)
+            at_bottom = state["bottom"]
+            if state["moved"]:
+                deadline = time.monotonic() + loading_wait
+        wait_for_scroll(page, scroll_wait, cancel)
+
+
+def find_track_button(page, track_id, cancel, scroll_wait, loading_wait):
+    button = page.locator(TRACKS).filter(has=page.locator(f'xpath=self::*[@id="{track_id}"]'))
+    deadline = time.monotonic() + loading_wait
+    rewound = False
+    while True:
+        check_cancelled(cancel)
+        validate_purchase_page(page)
+        count = button.count()
+        if count == 1:
+            return button
+        if count > 1:
+            raise DownloadError(f"Amazon returned duplicate buttons for track {track_id}.")
+        if time.monotonic() >= deadline:
+            raise DownloadError(f"Could not find track {track_id} while scrolling Purchased. No download was started for it.")
+        state = scroll_library(page)
+        if state["bottom"] and not state["moved"] and not rewound:
+            state = scroll_library(page, to_top=True)
+            rewound = True
+        if state["moved"]:
+            deadline = time.monotonic() + loading_wait
+        wait_for_scroll(page, scroll_wait, cancel)
 
 
 def read_manifest(directory):
@@ -175,7 +248,8 @@ def save_download(download, directory, track_id):
             os.unlink(temp)
 
 
-def download_tracks(page, directory, tracks, cancel, log):
+def download_tracks(page, directory, tracks, cancel, log, *, scroll_wait=1, loading_wait=30):
+    validate_scan_timing(scroll_wait, loading_wait)
     directory = Path(directory)
     history = read_manifest(directory)
     completed = 0
@@ -188,9 +262,7 @@ def download_tracks(page, directory, tracks, cancel, log):
             log(f"{number}/{len(tracks)}: already downloaded: {track['label']}")
             completed += 1
             continue
-        button = page.locator(TRACKS).filter(has=page.locator(f'xpath=self::*[@id="{track_id}"]'))
-        if button.count() != 1:
-            raise DownloadError(f"Track {track_id} is no longer visible in the loaded library.")
+        button = find_track_button(page, track_id, cancel, scroll_wait, loading_wait)
         log(f"{number}/{len(tracks)}: downloading {track['label']}")
         button.click(timeout=10000)
         try:
