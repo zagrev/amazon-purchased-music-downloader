@@ -1,7 +1,12 @@
 import argparse
+import ctypes
+import json
+import os
 import queue
+import tempfile
 import threading
 import tkinter as tk
+from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font
@@ -24,6 +29,46 @@ BROWSERS = {
 }
 
 
+def window_position_path():
+    local = os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
+    return Path(local) / "AmazonPurchasedMusicDownloader" / "window-position.json"
+
+
+def read_window_position(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(data, dict) or any(
+        type(data.get(axis)) is not int or not -(2**31) <= data[axis] <= 2**31 - 101
+        for axis in ("x", "y")
+    ):
+        raise ValueError("Window position must contain valid integer x and y coordinates.")
+    return data["x"], data["y"]
+
+
+def write_window_position(path, position):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".window-position-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(dict(zip(("x", "y"), position)), file)
+            file.write("\n")
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def window_position_visible(position):
+    x, y = position
+    title_bar = wintypes.RECT(x, y, x + 100, y + 30)
+    monitor_from_rect = ctypes.windll.user32.MonitorFromRect
+    monitor_from_rect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
+    monitor_from_rect.restype = wintypes.HANDLE
+    return bool(monitor_from_rect(ctypes.byref(title_bar), 0))
+
+
 class App(tk.Tk):
     def __init__(self, browser="edge"):
         if browser not in BROWSERS:
@@ -41,6 +86,8 @@ class App(tk.Tk):
         self.session_closed = False
         self.browser_open = False
         self.scanned_count = None
+        self.position_file = window_position_path()
+        self.window_position = None
 
         default_font = font.nametofont("TkDefaultFont")
         default_font.configure(family="Segoe UI", size=12)
@@ -92,9 +139,27 @@ class App(tk.Tk):
         self.stop_button.pack(side="left", padx=8)
         self.log_box = tk.Text(frame, height=15, wrap="word", state="disabled")
         self.log_box.pack(fill="both", expand=True, pady=(14, 0))
+        self.restore_window_position()
+        self.bind("<Configure>", self.remember_window_position, add="+")
         self.protocol("WM_DELETE_WINDOW", self.close)
         threading.Thread(target=self.worker, daemon=True).start()
         self.after(100, self.poll)
+
+    def restore_window_position(self):
+        try:
+            position = read_window_position(self.position_file)
+        except (OSError, ValueError) as exc:
+            self.log(f"Could not restore window position: {exc}. Using the default position.")
+            return
+        if position is not None:
+            if window_position_visible(position):
+                self.geometry(f"+{position[0]}+{position[1]}")
+            else:
+                self.log("The saved window position is off-screen. Using the default position.")
+
+    def remember_window_position(self, event=None):
+        if (event is None or event.widget is self) and self.state() == "normal":
+            self.window_position = self.winfo_x(), self.winfo_y()
 
     def browse(self):
         selected = filedialog.askdirectory(parent=self, initialdir=self.folder.get())
@@ -174,6 +239,13 @@ class App(tk.Tk):
     def close(self):
         if self.closing:
             return
+        self.remember_window_position()
+        if self.window_position is not None:
+            try:
+                write_window_position(self.position_file, self.window_position)
+            except OSError as exc:
+                self.log(f"Could not save window position: {exc}")
+                messagebox.showerror("Window position", f"Could not save window position: {exc}", parent=self)
         if self.session_closed:
             self.destroy()
             return

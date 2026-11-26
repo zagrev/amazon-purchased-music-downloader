@@ -1,11 +1,14 @@
 import io
+import json
 import queue
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from app import App, main
+from app import App, main, read_window_position, write_window_position
 from downloader import Cancelled, DownloadError, collect_tracks
 
 
@@ -234,6 +237,78 @@ class BrowserSelectionTests(unittest.TestCase):
                     if kind == "log":
                         logs.append(value)
                 self.assertEqual(logs, [])
+
+
+class WindowPositionTests(unittest.TestCase):
+    def test_saved_position_round_trip_and_replacement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "settings" / "window-position.json"
+            self.assertIsNone(read_window_position(path))
+            write_window_position(path, (-1200, 100))
+            self.assertEqual(read_window_position(path), (-1200, 100))
+            write_window_position(path, (250, 180))
+            self.assertEqual(read_window_position(path), (250, 180))
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_invalid_positions_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "window-position.json"
+            for data in [
+                [], {}, {"x": True, "y": 10}, {"x": "100", "y": 10},
+                {"x": 100, "y": 1.5}, {"x": 2**40, "y": 10},
+            ]:
+                with self.subTest(data=data):
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        read_window_position(path)
+
+    def test_restore_handles_invalid_file_and_offscreen_position(self):
+        app = SimpleNamespace(position_file=Path("unused"), geometry=Mock(), log=Mock())
+        with patch("app.read_window_position", side_effect=ValueError("Invalid position")):
+            App.restore_window_position(app)
+            app.geometry.assert_not_called()
+            self.assertIn("Could not restore", app.log.call_args.args[0])
+        with (
+            patch("app.read_window_position", return_value=(10000, 10000)),
+            patch("app.window_position_visible", return_value=False),
+        ):
+            App.restore_window_position(app)
+            app.geometry.assert_not_called()
+            self.assertIn("off-screen", app.log.call_args.args[0])
+        with (
+            patch("app.read_window_position", return_value=(-1200, 100)),
+            patch("app.window_position_visible", return_value=True),
+        ):
+            App.restore_window_position(app)
+            app.geometry.assert_called_once_with("+-1200+100")
+
+    def test_minimized_and_maximized_positions_do_not_replace_last_placement(self):
+        app = SimpleNamespace(
+            window_position=None, state=Mock(return_value="normal"),
+            winfo_x=Mock(return_value=250), winfo_y=Mock(return_value=180),
+        )
+        App.remember_window_position(app)
+        self.assertEqual(app.window_position, (250, 180))
+        for state in ("iconic", "zoomed"):
+            app.state.return_value = state
+            app.winfo_x.return_value = -32000
+            app.winfo_y.return_value = -32000
+            App.remember_window_position(app)
+            self.assertEqual(app.window_position, (250, 180))
+
+    def test_save_failure_is_reported_and_does_not_prevent_close(self):
+        app = SimpleNamespace(
+            closing=False, session_closed=True, window_position=(250, 180),
+            position_file=Path("unused"), remember_window_position=Mock(), log=Mock(), destroy=Mock(),
+        )
+        with (
+            patch("app.write_window_position", side_effect=OSError("Access denied")),
+            patch("app.messagebox.showerror") as error,
+        ):
+            App.close(app)
+            error.assert_called_once()
+            self.assertIn("Access denied", app.log.call_args.args[0])
+            app.destroy.assert_called_once()
 
 
 if __name__ == "__main__":
