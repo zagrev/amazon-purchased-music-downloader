@@ -16,6 +16,7 @@ from downloader import (
     open_purchased_page,
     read_manifest,
     validate_scan_timing,
+    wait_with_cancel,
 )
 
 
@@ -229,6 +230,48 @@ class DownloadTests(unittest.TestCase):
             (directory / history["TRACK2"]).unlink()
             download_tracks(self.page, directory, tracks, self.cancel, lambda _: None)
             self.assertTrue((directory / read_manifest(directory)["TRACK2"]).is_file())
+
+    def test_configured_pause_is_between_downloads_not_skipped_or_final_tracks(self):
+        tracks = collect_tracks(self.page, 3, self.cancel, lambda _: None)
+        with tempfile.TemporaryDirectory() as temp:
+            download_tracks(self.page, temp, [tracks[1]], self.cancel, lambda _: None, download_delay=0)
+            self.page.evaluate("window.menuTimes = []")
+            self.page.locator('button[data-testid="IconButton,TrackListItem_ContextMenu"]').evaluate_all(
+                """buttons => buttons.forEach(button => button.addEventListener('click',
+                    () => window.menuTimes.push(performance.now())))"""
+            )
+            with patch("downloader.wait_with_cancel", wraps=wait_with_cancel) as pause:
+                self.assertEqual(download_tracks(
+                    self.page, temp, tracks, self.cancel, lambda _: None, download_delay=0.75,
+                ), 3)
+                pause.assert_called_once_with(self.page, 0.75, self.cancel)
+            times = self.page.evaluate("window.menuTimes")
+            self.assertEqual(len(times), 2)
+            self.assertGreaterEqual(times[1] - times[0], 750)
+
+    def test_stop_during_long_download_pause_preserves_first_download(self):
+        tracks = collect_tracks(self.page, 3, self.cancel, lambda _: None)
+        original_wait = self.page.wait_for_timeout
+
+        def stop_during_wait(milliseconds):
+            original_wait(milliseconds)
+            self.cancel.set()
+
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(self.page, "wait_for_timeout", side_effect=stop_during_wait) as wait:
+                with self.assertRaises(Cancelled):
+                    download_tracks(self.page, temp, tracks, self.cancel, lambda _: None, download_delay=60)
+                wait.assert_called_once_with(250)
+            self.assertEqual(set(read_manifest(Path(temp))), {"TRACK1"})
+            self.assertEqual(len(list(Path(temp).glob("*.mp3"))), 1)
+
+    def test_invalid_download_pauses_fail_before_browser_operations(self):
+        for delay in (-1, float("nan"), float("inf")):
+            with self.subTest(delay=delay):
+                page = Mock()
+                with self.assertRaisesRegex(DownloadError, "Download pause"):
+                    download_tracks(page, Path("unused"), [], self.cancel, lambda _: None, download_delay=delay)
+                self.assertEqual(page.mock_calls, [])
 
     def test_track_names_come_from_title_not_menu_description(self):
         for title in ["A Song (Live)", "More details on Love", "More options for Love"]:

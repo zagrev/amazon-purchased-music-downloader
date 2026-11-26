@@ -16,7 +16,7 @@ from playwright.sync_api import sync_playwright
 
 from downloader import (
     Cancelled, DownloadError, PURCHASES_URL, collect_tracks, download_tracks,
-    open_purchased_page, validate_scan_timing,
+    open_purchased_page, validate_download_delay, validate_scan_timing,
 )
 
 
@@ -127,6 +127,12 @@ class App(tk.Tk):
         self.loading_wait = tk.StringVar(value="30")
         ttk.Entry(timing_row, textvariable=self.loading_wait, width=6).pack(side="left", padx=8)
 
+        delay_row = ttk.Frame(frame)
+        delay_row.pack(fill="x", pady=(0, 12))
+        ttk.Label(delay_row, text="Between downloads (seconds):").pack(side="left")
+        self.download_delay = tk.StringVar(value="0.5")
+        ttk.Entry(delay_row, textvariable=self.download_delay, width=6).pack(side="left", padx=8)
+
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x")
         self.start_button = ttk.Button(buttons, text="Open Amazon Music", command=self.start)
@@ -211,6 +217,12 @@ class App(tk.Tk):
         timing = self.read_scan_timing()
         if timing is None:
             return
+        try:
+            delay = float(self.download_delay.get())
+            validate_download_delay(delay)
+        except (ValueError, DownloadError) as exc:
+            messagebox.showerror("Download pause", f"Invalid download pause: {exc}")
+            return
         if not self.folder.get().strip():
             messagebox.showerror("Save folder", "Choose a save folder.")
             return
@@ -220,7 +232,7 @@ class App(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Save folder", str(exc))
             return
-        self.submit("download", (directory, count, *timing))
+        self.submit("download", (directory, count, *timing, delay))
 
     def update_buttons(self):
         idle = not self.running and not self.closing
@@ -305,7 +317,7 @@ class App(tk.Tk):
                                     log(f"Scan found {len(cached_tracks)} tracks. Check or adjust the count, then click Download. "
                                         "A paused or partial list may undercount your purchases.")
                                 elif action == "download":
-                                    directory, count, scroll_wait, loading_wait = payload
+                                    directory, count, scroll_wait, loading_wait, download_delay = payload
                                     if cached_tracks is None:
                                         raise DownloadError(
                                             "Scan Purchased in the current browser session before downloading."
@@ -316,9 +328,11 @@ class App(tk.Tk):
                                             "Check the full-library count and rescan if tracks are missing."
                                         )
                                     log(f"Using cached scan of {len(cached_tracks)} tracks; no full rescan needed.")
+                                    log(f"Pause between downloads: {download_delay:g} seconds.")
                                     completed = download_tracks(
                                         page, directory, cached_tracks, self.cancel, log,
                                         scroll_wait=scroll_wait, loading_wait=loading_wait,
+                                        download_delay=download_delay,
                                     )
                                     log(f"Finished: {completed} tracks downloaded or previously recorded.")
                         except (DownloadError, Cancelled, PlaywrightError, OSError) as exc:

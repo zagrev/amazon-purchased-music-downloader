@@ -59,7 +59,7 @@ class SessionTests(unittest.TestCase):
                 finish_command()
                 app.commands.put(("scan", (3, 60)))
                 self.assertIn("Stopped: Wrong count", finish_command())
-                app.commands.put(("download", ("destination", 1, 3, 60)))
+                app.commands.put(("download", ("destination", 1, 3, 60, 2.5)))
                 self.assertIn(
                     "Stopped: Scan Purchased in the current browser session before downloading.",
                     finish_command(),
@@ -67,16 +67,16 @@ class SessionTests(unittest.TestCase):
                 download.assert_not_called()
                 app.commands.put(("scan", (3, 60)))
                 finish_command()
-                app.commands.put(("download", ("destination", 2, 3, 60)))
+                app.commands.put(("download", ("destination", 2, 3, 60, 2.5)))
                 self.assertTrue(any("cached scan contains 1 tracks" in log for log in finish_command()))
                 download.assert_not_called()
-                app.commands.put(("download", ("destination", 1, 3, 60)))
+                app.commands.put(("download", ("destination", 1, 3, 60, 2.5)))
                 self.assertIn("Stopped: Download failed", finish_command())
-                app.commands.put(("download", ("destination", 1, 3, 60)))
+                app.commands.put(("download", ("destination", 1, 3, 60, 2.5)))
                 self.assertIn("Finished: 1 tracks downloaded or previously recorded.", finish_command())
-                app.commands.put(("download", ("destination", 1, 3, 60)))
+                app.commands.put(("download", ("destination", 1, 3, 60, 2.5)))
                 self.assertIn("Stopped: Stopped by user.", finish_command())
-                app.commands.put(("download", ("destination", 1, 3, 60)))
+                app.commands.put(("download", ("destination", 1, 3, 60, 2.5)))
                 self.assertIn("Finished: 1 tracks downloaded or previously recorded.", finish_command())
                 self.assertEqual(collect.call_count, 2)
                 for call in collect.call_args_list:
@@ -84,7 +84,7 @@ class SessionTests(unittest.TestCase):
                 self.assertEqual(download.call_count, 4)
                 for call in download.call_args_list:
                     self.assertIs(call.args[2], tracks)
-                    self.assertEqual(call.kwargs, {"scroll_wait": 3, "loading_wait": 60})
+                    self.assertEqual(call.kwargs, {"scroll_wait": 3, "loading_wait": 60, "download_delay": 2.5})
                 playwright.chromium.launch.assert_called_once()
                 browser.new_context.assert_called_once_with(accept_downloads=True)
                 app.cancel.set()
@@ -93,7 +93,7 @@ class SessionTests(unittest.TestCase):
                 app.commands.put(("scan", (3, 60)))
                 self.assertIn("Stopped: Stopped by user.", finish_command())
                 app.cancel.clear()
-                app.commands.put(("download", ("destination", 1, 3, 60)))
+                app.commands.put(("download", ("destination", 1, 3, 60, 2.5)))
                 self.assertIn(
                     "Stopped: Scan Purchased in the current browser session before downloading.",
                     finish_command(),
@@ -141,7 +141,7 @@ class SessionTests(unittest.TestCase):
 
                 collect.side_effect = scan
                 app.commands.put(("scan", (1, 30)))
-                app.commands.put(("download", ("destination", 1, 1, 30)))
+                app.commands.put(("download", ("destination", 1, 1, 30, 0.5)))
                 app.commands.put(("close", None))
                 App.worker(app)
                 collect.assert_called_once()
@@ -173,7 +173,7 @@ class SessionTests(unittest.TestCase):
             browser.new_context.return_value.new_page.return_value.is_closed.return_value = False
             app.commands.put(("scan", (1, 30)))
             app.commands.put(("scan", (1, 30)))
-            app.commands.put(("download", ("destination", 1, 1, 30)))
+            app.commands.put(("download", ("destination", 1, 1, 30, 0.5)))
             app.commands.put(("close", None))
             App.worker(app)
             collect.assert_called_once()

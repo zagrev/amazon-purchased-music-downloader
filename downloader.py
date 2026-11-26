@@ -73,7 +73,12 @@ def validate_scan_timing(scroll_wait, loading_wait):
         raise DownloadError("No-progress wait must be at least as long as the scroll wait.")
 
 
-def wait_for_scroll(page, seconds, cancel):
+def validate_download_delay(seconds):
+    if not math.isfinite(seconds) or seconds < 0:
+        raise DownloadError("Download pause must be a finite number of seconds, at least 0.")
+
+
+def wait_with_cancel(page, seconds, cancel):
     remaining = seconds * 1000
     while remaining > 0:
         check_cancelled(cancel)
@@ -123,7 +128,7 @@ def collect_tracks(page, expected, cancel, log, *, scroll_wait=1, loading_wait=3
         if tracks and not started:
             started = True
             if scroll_library(page, to_top=True)["moved"]:
-                wait_for_scroll(page, scroll_wait, cancel)
+                wait_with_cancel(page, scroll_wait, cancel)
                 deadline = time.monotonic() + loading_wait
                 continue
         previous_count = len(seen)
@@ -159,7 +164,7 @@ def collect_tracks(page, expected, cancel, log, *, scroll_wait=1, loading_wait=3
             at_bottom = state["bottom"]
             if state["moved"]:
                 deadline = time.monotonic() + loading_wait
-        wait_for_scroll(page, scroll_wait, cancel)
+        wait_with_cancel(page, scroll_wait, cancel)
 
 
 def find_track_button(page, track_id, cancel, scroll_wait, loading_wait):
@@ -182,7 +187,7 @@ def find_track_button(page, track_id, cancel, scroll_wait, loading_wait):
             rewound = True
         if state["moved"]:
             deadline = time.monotonic() + loading_wait
-        wait_for_scroll(page, scroll_wait, cancel)
+        wait_with_cancel(page, scroll_wait, cancel)
 
 
 def read_manifest(directory):
@@ -248,11 +253,13 @@ def save_download(download, directory, track_id):
             os.unlink(temp)
 
 
-def download_tracks(page, directory, tracks, cancel, log, *, scroll_wait=1, loading_wait=30):
+def download_tracks(page, directory, tracks, cancel, log, *, scroll_wait=1, loading_wait=30, download_delay=0.5):
     validate_scan_timing(scroll_wait, loading_wait)
+    validate_download_delay(download_delay)
     directory = Path(directory)
     history = read_manifest(directory)
     completed = 0
+    has_downloaded = False
     for number, track in enumerate(tracks, 1):
         check_cancelled(cancel)
         validate_purchase_page(page)
@@ -262,6 +269,8 @@ def download_tracks(page, directory, tracks, cancel, log, *, scroll_wait=1, load
             log(f"{number}/{len(tracks)}: already downloaded: {track['label']}")
             completed += 1
             continue
+        if has_downloaded:
+            wait_with_cancel(page, download_delay, cancel)
         button = find_track_button(page, track_id, cancel, scroll_wait, loading_wait)
         log(f"{number}/{len(tracks)}: downloading {track['label']}")
         button.click(timeout=10000)
@@ -274,5 +283,5 @@ def download_tracks(page, directory, tracks, cancel, log, *, scroll_wait=1, load
         history[track_id] = filename
         write_manifest(directory, history)
         completed += 1
-        page.wait_for_timeout(500)
+        has_downloaded = True
     return completed
