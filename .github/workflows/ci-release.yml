@@ -1,0 +1,131 @@
+name: Tests and Windows release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install test dependencies and Edge
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
+          python -m playwright install msedge
+          if ($LASTEXITCODE -ne 0) { throw "Edge installation failed." }
+      - name: Run unit and browser integration tests
+        run: python -m unittest discover -v
+
+  release:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: windows-release-${{ github.sha }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+      - name: Reserve release version
+        id: version
+        shell: pwsh
+        run: |
+          $plan = python release_version.py $env:GITHUB_REPOSITORY $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Could not reserve release version." }
+          $plan = $plan | ConvertFrom-Json
+          "version=$($plan.version)" >> $env:GITHUB_OUTPUT
+          "existing=$($plan.existing.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "published=$($plan.published.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+      - name: Install packaging dependencies
+        if: steps.version.outputs.published != 'true'
+        run: python -m pip install -r requirements-build.txt
+      - name: Build portable Windows application
+        if: steps.version.outputs.published != 'true'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python -m PyInstaller --noconfirm --clean --onedir --name AmazonPurchasedMusicDownloader app.py
+          if ($LASTEXITCODE -ne 0) { throw "Application build failed." }
+          Copy-Item README.md "dist\AmazonPurchasedMusicDownloader\README.md"
+          Set-Content -Encoding ascii "dist\AmazonPurchasedMusicDownloader\VERSION.txt" $env:RELEASE_VERSION
+      - name: Check executable and bundled browser driver
+        if: steps.version.outputs.published != 'true'
+        shell: pwsh
+        run: |
+          $folder = "dist\AmazonPurchasedMusicDownloader"
+          & "$folder\AmazonPurchasedMusicDownloader.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw "Packaged command-line check failed." }
+          & "$folder\_internal\playwright\driver\node.exe" "$folder\_internal\playwright\driver\package\cli.js" --version
+          if ($LASTEXITCODE -ne 0) { throw "Bundled Playwright driver check failed." }
+          $app = Start-Process "$folder\AmazonPurchasedMusicDownloader.exe" -PassThru
+          try {
+            $deadline = (Get-Date).AddSeconds(30)
+            do {
+              Start-Sleep -Milliseconds 250
+              $app.Refresh()
+              if ($app.HasExited) { throw "Packaged app exited before opening its window." }
+            } while ($app.MainWindowTitle -ne "Purchased Music Downloader" -and (Get-Date) -lt $deadline)
+            if ($app.MainWindowTitle -ne "Purchased Music Downloader") { throw "Packaged app window did not open." }
+            if (-not $app.CloseMainWindow()) { throw "Could not close packaged app normally." }
+            if (-not $app.WaitForExit(30000)) { throw "Packaged app did not shut down." }
+            if ($app.ExitCode -ne 0) { throw "Packaged app exited with an error." }
+          } finally {
+            $app.Refresh()
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id }
+          }
+      - name: Create versioned ZIP
+        if: steps.version.outputs.published != 'true'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $zip = "AmazonPurchasedMusicDownloader-v$env:RELEASE_VERSION-windows-x64.zip"
+          Compress-Archive -Path "dist\AmazonPurchasedMusicDownloader" -DestinationPath $zip
+      - name: Publish release after all checks pass
+        if: steps.version.outputs.published != 'true'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          EXISTING_RELEASE: ${{ steps.version.outputs.existing }}
+        run: |
+          $tag = "v$env:RELEASE_VERSION"
+          $zip = "AmazonPurchasedMusicDownloader-$tag-windows-x64.zip"
+          if ($env:EXISTING_RELEASE -ne "true") {
+            gh release create $tag --verify-tag --title $tag --draft --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw "Could not create draft release." }
+          }
+          gh release upload $tag $zip --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload release ZIP." }
+          gh release edit $tag --draft=false
+          if ($LASTEXITCODE -ne 0) { throw "Could not publish release." }

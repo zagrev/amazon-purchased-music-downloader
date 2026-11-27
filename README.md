@@ -4,6 +4,18 @@ A Windows app that uses Amazon Music's Purchased page and its normal Download ac
 
 ## Setup
 
+### Download the Windows release
+
+Download the latest `AmazonPurchasedMusicDownloader-vX.Y.Z-windows-x64.zip` from [GitHub Releases](https://github.com/zagrev/amazon-purchased-music-downloader/releases). Extract the entire ZIP and run `AmazonPurchasedMusicDownloader.exe` inside its folder. Keep the bundled `_internal` folder next to the executable. Python is not required; Microsoft Edge must be installed for the default browser. Chrome can also be selected from PowerShell:
+
+```powershell
+.\AmazonPurchasedMusicDownloader.exe --browser chrome
+```
+
+The release includes `VERSION.txt`. It is an unsigned Windows x64 application, so Windows may show a SmartScreen warning. Browser binaries are not bundled: use installed Edge/Chrome with the portable release, or follow the source setup below for Playwright-managed Chromium/Firefox/WebKit.
+
+### Run from source
+
 Install Python with Tkinter and Microsoft Edge, then run in PowerShell from this folder:
 
 ```powershell
@@ -53,3 +65,18 @@ Successful scans replace the in-memory cache. Starting a rescan discards the pre
 Progress messages use the Purchased row's dedicated title element, not the context-menu button description. If a unique title cannot be found, the app reports a page-structure error rather than guessing a name. Files are saved with the Amazon track ID prefixed to Amazon's filename. Existing files are never overwritten. The destination contains `.amazon-music-downloads.json`, a local record used to skip previously downloaded files; missing or empty files are downloaded again. Do not edit the history or move recorded files without understanding that they may be downloaded again. If a download or history write fails, the app stops and reports the error.
 
 Sign-in happens only in the separate browser window; the app does not ask for or save your password. Sign-in cookies and browser storage are retained in an isolated, non-persistent browser context for the current app session only, not saved as a reusable profile. Keep that window open to reuse sign-in; closing the browser or an expired Amazon session can require signing in again. Its track-count check relies on the count you confirm and cannot independently prove Amazon displayed every purchase. Downloads and available formats depend on Amazon and your account.
+
+## CI and automatic releases
+
+GitHub Actions runs `python -m unittest discover -v` on Windows with Python 3.12 and Edge for pull requests targeting `main` and pushes to `main`. Pull requests never publish releases. After tests pass on `main`, the release job builds a portable application with PyInstaller, checks its command-line interface, bundled Playwright driver, GUI startup and shutdown, then publishes the ZIP.
+
+The first release is `v0.1.0`. Later releases increment the highest stable `vMAJOR.MINOR.PATCH` patch number numerically, considering tags and releases (including reserved drafts). After tests pass, the workflow reserves a version by creating a tag at the exact tested commit before packaging; competing releases retry with the next available version. The version is recorded in the ZIP name and `VERSION.txt`, without making an extra version-bump commit on `main`. Different commits can release concurrently, so versions reflect reservation order rather than necessarily commit order. Runs for the same commit are serialized. A rerun reuses its reserved tag, resumes a draft, or skips an already published release. A failed build leaves a reserved tag but no published release; failed uploads leave a draft. Rerun the workflow to resume either case. GitHub determines which release is marked latest.
+
+The workflow can also be run manually on `main` from the Actions tab. To resume an older failed commit, rerun its original workflow run rather than starting a new manual run on the current `main`. GitHub Actions must be enabled, and the release job uses the repository's `GITHUB_TOKEN` with `contents: write` to create releases; no personal access token is needed. The repository/organization must allow that permission.
+
+To build locally on Windows using Python 3.12:
+
+```powershell
+python -m pip install -r requirements-build.txt
+python -m PyInstaller --noconfirm --clean --onedir --name AmazonPurchasedMusicDownloader app.py
+```
